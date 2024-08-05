@@ -2,139 +2,100 @@ import os
 import fitz  # PyMuPDF
 from PIL import Image
 import io
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import Chroma
-from langchain.chat_models import ChatOpenAI
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
-from langchain.schema import Document
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from openai import OpenAI
+from typing import List, Tuple
 
 # Set your OpenAI API key
 os.environ["OPENAI_API_KEY"] = "your_openai_api_key_here"
+client = OpenAI()
 
-def extract_content_from_pdf(pdf_path):
+class PDFContent:
+    def __init__(self, text: str, images: List[Image.Image], page_num: int):
+        self.text = text
+        self.images = images
+        self.page_num = page_num
+
+def extract_content_from_pdf(pdf_path: str) -> List[PDFContent]:
     doc = fitz.open(pdf_path)
     content = []
-    images = {}
     
     for page_num in range(len(doc)):
         page = doc[page_num]
         
-        # Extract text and images
-        blocks = page.get_text("blocks")
+        # Extract text
+        text = page.get_text()
+        
+        # Extract images
         image_list = page.get_images(full=True)
+        images = []
+        for img in image_list:
+            xref = img[0]
+            base_image = doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            image = Image.open(io.BytesIO(image_bytes))
+            images.append(image)
         
-        # Sort blocks by vertical position
-        blocks.sort(key=lambda b: b[1])  # Sort by y0 coordinate
-        
-        current_text = ""
-        current_images = []
-        
-        for block in blocks:
-            if block[6] == 0:  # Text block
-                if current_text and current_images:
-                    content.append({
-                        "page_num": page_num + 1,
-                        "text": current_text.strip(),
-                        "images": ",".join(current_images)
-                    })
-                    current_text = ""
-                    current_images = []
-                current_text += block[4] + " "
-            elif block[6] == 1:  # Image block
-                img_index = len(current_images)
-                image_key = f"page_{page_num + 1}_image_{img_index + 1}"
-                for img in image_list:
-                    if img[0] == block[7]:  # xref matches
-                        base_image = doc.extract_image(img[0])
-                        image_bytes = base_image["image"]
-                        image = Image.open(io.BytesIO(image_bytes))
-                        images[image_key] = image
-                        current_images.append(image_key)
-                        break
-        
-        # Add any remaining content
-        if current_text or current_images:
-            content.append({
-                "page_num": page_num + 1,
-                "text": current_text.strip(),
-                "images": ",".join(current_images)
-            })
+        content.append(PDFContent(text, images, page_num + 1))
     
-    return content, images
+    return content
 
-def create_vector_store(content):
-    documents = [
-        Document(
-            page_content=item["text"],
-            metadata={
-                "page_num": item["page_num"],
-                "images": item["images"]
-            }
-        ) for item in content
-    ]
-    
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    texts = text_splitter.split_documents(documents)
-    
-    embeddings = OpenAIEmbeddings()
-    vector_store = Chroma.from_documents(texts, embeddings)
-    return vector_store
+def create_tfidf_matrix(content: List[PDFContent]) -> Tuple[TfidfVectorizer, np.ndarray]:
+    vectorizer = TfidfVectorizer()
+    tfidf_matrix = vectorizer.fit_transform([item.text for item in content])
+    return vectorizer, tfidf_matrix
 
-def get_relevant_images(images, metadata):
-    image_keys = metadata["images"].split(",") if metadata["images"] else []
-    return [images[img_key] for img_key in image_keys if img_key in images]
+def get_most_relevant_content(query: str, content: List[PDFContent], vectorizer: TfidfVectorizer, tfidf_matrix: np.ndarray, top_k: int = 3) -> List[PDFContent]:
+    query_vector = vectorizer.transform([query])
+    similarities = cosine_similarity(query_vector, tfidf_matrix).flatten()
+    top_indices = similarities.argsort()[-top_k:][::-1]
+    return [content[i] for i in top_indices]
 
-def answer_question(question, vector_store, images):
-    llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo")
+def generate_answer(query: str, relevant_content: List[PDFContent]) -> str:
+    context = "\n\n".join([f"Page {item.page_num}:\n{item.text}" for item in relevant_content])
     
-    prompt_template = """
-    You are an AI assistant that answers questions based on a user manual. 
+    prompt = f"""You are an AI assistant that answers questions based on a user manual. 
     Use the following context to answer the question. If you can't answer the question based on the context, say "I don't have enough information to answer that question."
     There might be images associated with this content. Mention that there are images available if they are relevant to the answer.
 
-    Context: {context}
+    Context:
+    {context}
 
-    Question: {question}
+    Question: {query}
 
-    Answer:
-    """
-    
-    PROMPT = PromptTemplate(
-        template=prompt_template, input_variables=["context", "question"]
+    Answer:"""
+
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0,
+        max_tokens=300
     )
-    
-    chain_type_kwargs = {"prompt": PROMPT}
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm, 
-        chain_type="stuff", 
-        retriever=vector_store.as_retriever(search_kwargs={"k": 3}),
-        chain_type_kwargs=chain_type_kwargs,
-        return_source_documents=True
-    )
-    
-    result = qa_chain({"query": question})
-    answer = result['result']
-    source_docs = result['source_documents']
-    
-    relevant_images = []
-    for doc in source_docs:
-        relevant_images.extend(get_relevant_images(images, doc.metadata))
-    
+
+    return response.choices[0].message.content
+
+def answer_question(question: str, content: List[PDFContent], vectorizer: TfidfVectorizer, tfidf_matrix: np.ndarray) -> Tuple[str, List[Image.Image]]:
+    relevant_content = get_most_relevant_content(question, content, vectorizer, tfidf_matrix)
+    answer = generate_answer(question, relevant_content)
+    relevant_images = [img for item in relevant_content for img in item.images]
     return answer, relevant_images
 
 # Main execution
 pdf_path = "path_to_your_user_manual.pdf"
-content, images = extract_content_from_pdf(pdf_path)
-vector_store = create_vector_store(content)
+content = extract_content_from_pdf(pdf_path)
+vectorizer, tfidf_matrix = create_tfidf_matrix(content)
 
 while True:
     question = input("Ask a question about the user manual (or type 'quit' to exit): ")
     if question.lower() == 'quit':
         break
     
-    answer, relevant_images = answer_question(question, vector_store, images)
+    answer, relevant_images = answer_question(question, content, vectorizer, tfidf_matrix)
     print(f"Answer: {answer}")
     
     if relevant_images:
