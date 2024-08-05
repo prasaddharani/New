@@ -1,0 +1,125 @@
+import os
+import fitz  # PyMuPDF
+from PIL import Image
+import io
+from langchain.document_loaders import PyMuPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.chat_models import ChatOpenAI
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+
+# Set your OpenAI API key
+os.environ["OPENAI_API_KEY"] = "your_openai_api_key_here"
+
+def extract_content_from_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    content = []
+    images = {}
+    
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        
+        # Extract text
+        text = page.get_text()
+        
+        # Extract images
+        image_list = page.get_images(full=True)
+        page_images = []
+        for img_index, img in enumerate(image_list):
+            xref = img[0]
+            base_image = doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            image = Image.open(io.BytesIO(image_bytes))
+            image_key = f"page_{page_num + 1}_image_{img_index + 1}"
+            images[image_key] = image
+            page_images.append(image_key)
+        
+        content.append({
+            "page_num": page_num + 1,
+            "text": text,
+            "images": page_images
+        })
+    
+    return content, images
+
+def create_vector_store(content):
+    documents = [
+        {
+            "page_content": item["text"],
+            "metadata": {
+                "page_num": item["page_num"],
+                "images": item["images"]
+            }
+        } for item in content
+    ]
+    
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    texts = text_splitter.split_documents(documents)
+    
+    embeddings = OpenAIEmbeddings()
+    vector_store = Chroma.from_documents(texts, embeddings)
+    return vector_store
+
+def get_relevant_images(images, metadata):
+    return [images[img_key] for img_key in metadata["images"]]
+
+def answer_question(question, vector_store, images):
+    llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo")
+    
+    prompt_template = """
+    You are an AI assistant that answers questions based on a user manual. 
+    Use the following context to answer the question. If you can't answer the question based on the context, say "I don't have enough information to answer that question."
+    There might be images associated with this content. Mention that there are images available if they are relevant to the answer.
+
+    Context: {context}
+
+    Question: {question}
+
+    Answer:
+    """
+    
+    PROMPT = PromptTemplate(
+        template=prompt_template, input_variables=["context", "question"]
+    )
+    
+    chain_type_kwargs = {"prompt": PROMPT}
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm, 
+        chain_type="stuff", 
+        retriever=vector_store.as_retriever(search_kwargs={"k": 3}),
+        chain_type_kwargs=chain_type_kwargs,
+        return_source_documents=True
+    )
+    
+    result = qa_chain({"query": question})
+    answer = result['result']
+    source_docs = result['source_documents']
+    
+    relevant_images = []
+    for doc in source_docs:
+        relevant_images.extend(get_relevant_images(images, doc.metadata))
+    
+    return answer, relevant_images
+
+# Main execution
+pdf_path = "path_to_your_user_manual.pdf"
+content, images = extract_content_from_pdf(pdf_path)
+vector_store = create_vector_store(content)
+
+while True:
+    question = input("Ask a question about the user manual (or type 'quit' to exit): ")
+    if question.lower() == 'quit':
+        break
+    
+    answer, relevant_images = answer_question(question, vector_store, images)
+    print(f"Answer: {answer}")
+    
+    if relevant_images:
+        print(f"Found {len(relevant_images)} related images. Displaying...")
+        for i, image in enumerate(relevant_images):
+            image.show()
+            print(f"Image {i+1} displayed.")
+    else:
+        print("No related images found.")
