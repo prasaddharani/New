@@ -3,32 +3,30 @@ import fitz  # PyMuPDF
 from PIL import Image
 import io
 import re
-from openai import OpenAI
-from typing import List, Tuple, Dict
+from typing import List, Dict, Tuple
+from langchain.document_loaders import PyMuPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.chat_models import ChatOpenAI
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
 
 # Set your OpenAI API key
 os.environ["OPENAI_API_KEY"] = "your_openai_api_key_here"
-client = OpenAI()
 
-class PDFContent:
-    def __init__(self, text: str, page_num: int):
-        self.text = text
-        self.page_num = page_num
-
-def extract_content_and_images(pdf_path: str) -> Tuple[List[PDFContent], Dict[str, Image.Image]]:
+def extract_content_and_images(pdf_path: str) -> Tuple[List[Dict], Dict[str, Image.Image]]:
     doc = fitz.open(pdf_path)
     content = []
     images = {}
     
     for page_num in range(len(doc)):
         page = doc[page_num]
-        
-        # Extract text
         text = page.get_text()
-        content.append(PDFContent(text, page_num + 1))
         
         # Extract images and their tags
         img_list = page.get_images(full=True)
+        page_images = []
         for img_index, img in enumerate(img_list):
             xref = img[0]
             base_image = doc.extract_image(xref)
@@ -37,40 +35,59 @@ def extract_content_and_images(pdf_path: str) -> Tuple[List[PDFContent], Dict[st
             
             # Find the corresponding "Fig: image_name" tag
             matches = re.findall(r"Fig: ([\w\-]+)", text)
-            if matches:
-                image_tag = matches[img_index] if img_index < len(matches) else f"unnamed_image_{page_num}_{img_index}"
+            if matches and img_index < len(matches):
+                image_tag = matches[img_index]
                 images[image_tag] = image
+                page_images.append(image_tag)
+        
+        content.append({
+            "page_content": text,
+            "metadata": {
+                "page_num": page_num + 1,
+                "image_tags": page_images
+            }
+        })
     
     return content, images
 
-def generate_answer(query: str, content: List[PDFContent]) -> str:
-    context = "\n\n".join([f"Page {item.page_num}:\n{item.text}" for item in content])
+def create_vector_store(content: List[Dict]):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    docs = text_splitter.split_documents(content)
     
-    prompt = f"""You are an AI assistant that answers questions based on a user manual. 
+    embeddings = OpenAIEmbeddings()
+    vector_store = Chroma.from_documents(docs, embeddings)
+    return vector_store
+
+def answer_question(question: str, vector_store, images: Dict[str, Image.Image]) -> Tuple[str, List[Image.Image]]:
+    llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo")
+    
+    prompt_template = """
+    You are an AI assistant that answers questions based on a user manual. 
     Use the following context to answer the question. If you can't answer the question based on the context, say "I don't have enough information to answer that question."
     If there are relevant images, mention their tags in the format "Fig: image_name".
 
-    Context:
-    {context}
+    Context: {context}
 
-    Question: {query}
+    Question: {question}
 
-    Answer:"""
-
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0,
-        max_tokens=300
+    Answer:
+    """
+    
+    PROMPT = PromptTemplate(
+        template=prompt_template, input_variables=["context", "question"]
     )
-
-    return response.choices[0].message.content
-
-def answer_question(question: str, content: List[PDFContent], images: Dict[str, Image.Image]) -> Tuple[str, List[Image.Image]]:
-    answer = generate_answer(question, content)
+    
+    chain_type_kwargs = {"prompt": PROMPT}
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm, 
+        chain_type="stuff", 
+        retriever=vector_store.as_retriever(search_kwargs={"k": 3}),
+        chain_type_kwargs=chain_type_kwargs,
+        return_source_documents=True
+    )
+    
+    result = qa_chain({"query": question})
+    answer = result['result']
     
     # Extract mentioned image tags from the answer
     mentioned_tags = re.findall(r"Fig: ([\w\-]+)", answer)
@@ -81,13 +98,14 @@ def answer_question(question: str, content: List[PDFContent], images: Dict[str, 
 # Main execution
 pdf_path = "path_to_your_user_manual.pdf"
 content, images = extract_content_and_images(pdf_path)
+vector_store = create_vector_store(content)
 
 while True:
     question = input("Ask a question about the user manual (or type 'quit' to exit): ")
     if question.lower() == 'quit':
         break
     
-    answer, relevant_images = answer_question(question, content, images)
+    answer, relevant_images = answer_question(question, vector_store, images)
     print(f"Answer: {answer}")
     
     if relevant_images:
