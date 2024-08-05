@@ -2,63 +2,53 @@ import os
 import fitz  # PyMuPDF
 from PIL import Image
 import io
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+import re
 from openai import OpenAI
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 # Set your OpenAI API key
 os.environ["OPENAI_API_KEY"] = "your_openai_api_key_here"
 client = OpenAI()
 
 class PDFContent:
-    def __init__(self, text: str, images: List[Image.Image], page_num: int):
+    def __init__(self, text: str, page_num: int):
         self.text = text
-        self.images = images
         self.page_num = page_num
 
-def extract_content_from_pdf(pdf_path: str) -> List[PDFContent]:
+def extract_content_and_images(pdf_path: str) -> Tuple[List[PDFContent], Dict[str, Image.Image]]:
     doc = fitz.open(pdf_path)
     content = []
+    images = {}
     
     for page_num in range(len(doc)):
         page = doc[page_num]
         
         # Extract text
         text = page.get_text()
+        content.append(PDFContent(text, page_num + 1))
         
-        # Extract images
-        image_list = page.get_images(full=True)
-        images = []
-        for img in image_list:
+        # Extract images and their tags
+        img_list = page.get_images(full=True)
+        for img_index, img in enumerate(img_list):
             xref = img[0]
             base_image = doc.extract_image(xref)
             image_bytes = base_image["image"]
             image = Image.open(io.BytesIO(image_bytes))
-            images.append(image)
-        
-        content.append(PDFContent(text, images, page_num + 1))
+            
+            # Find the corresponding "Fig: image_name" tag
+            matches = re.findall(r"Fig: ([\w\-]+)", text)
+            if matches:
+                image_tag = matches[img_index] if img_index < len(matches) else f"unnamed_image_{page_num}_{img_index}"
+                images[image_tag] = image
     
-    return content
+    return content, images
 
-def create_tfidf_matrix(content: List[PDFContent]) -> Tuple[TfidfVectorizer, np.ndarray]:
-    vectorizer = TfidfVectorizer()
-    tfidf_matrix = vectorizer.fit_transform([item.text for item in content])
-    return vectorizer, tfidf_matrix
-
-def get_most_relevant_content(query: str, content: List[PDFContent], vectorizer: TfidfVectorizer, tfidf_matrix: np.ndarray, top_k: int = 3) -> List[PDFContent]:
-    query_vector = vectorizer.transform([query])
-    similarities = cosine_similarity(query_vector, tfidf_matrix).flatten()
-    top_indices = similarities.argsort()[-top_k:][::-1]
-    return [content[i] for i in top_indices]
-
-def generate_answer(query: str, relevant_content: List[PDFContent]) -> str:
-    context = "\n\n".join([f"Page {item.page_num}:\n{item.text}" for item in relevant_content])
+def generate_answer(query: str, content: List[PDFContent]) -> str:
+    context = "\n\n".join([f"Page {item.page_num}:\n{item.text}" for item in content])
     
     prompt = f"""You are an AI assistant that answers questions based on a user manual. 
     Use the following context to answer the question. If you can't answer the question based on the context, say "I don't have enough information to answer that question."
-    There might be images associated with this content. Mention that there are images available if they are relevant to the answer.
+    If there are relevant images, mention their tags in the format "Fig: image_name".
 
     Context:
     {context}
@@ -79,23 +69,25 @@ def generate_answer(query: str, relevant_content: List[PDFContent]) -> str:
 
     return response.choices[0].message.content
 
-def answer_question(question: str, content: List[PDFContent], vectorizer: TfidfVectorizer, tfidf_matrix: np.ndarray) -> Tuple[str, List[Image.Image]]:
-    relevant_content = get_most_relevant_content(question, content, vectorizer, tfidf_matrix)
-    answer = generate_answer(question, relevant_content)
-    relevant_images = [img for item in relevant_content for img in item.images]
+def answer_question(question: str, content: List[PDFContent], images: Dict[str, Image.Image]) -> Tuple[str, List[Image.Image]]:
+    answer = generate_answer(question, content)
+    
+    # Extract mentioned image tags from the answer
+    mentioned_tags = re.findall(r"Fig: ([\w\-]+)", answer)
+    relevant_images = [images[tag] for tag in mentioned_tags if tag in images]
+    
     return answer, relevant_images
 
 # Main execution
 pdf_path = "path_to_your_user_manual.pdf"
-content = extract_content_from_pdf(pdf_path)
-vectorizer, tfidf_matrix = create_tfidf_matrix(content)
+content, images = extract_content_and_images(pdf_path)
 
 while True:
     question = input("Ask a question about the user manual (or type 'quit' to exit): ")
     if question.lower() == 'quit':
         break
     
-    answer, relevant_images = answer_question(question, content, vectorizer, tfidf_matrix)
+    answer, relevant_images = answer_question(question, content, images)
     print(f"Answer: {answer}")
     
     if relevant_images:
